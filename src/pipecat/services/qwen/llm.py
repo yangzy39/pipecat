@@ -22,7 +22,7 @@ class QwenLLMService(OpenAILLMService):
         self,
         *,
         api_key: str,
-        base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         model: str = "qwen-plus",
         **kwargs,
     ):
@@ -30,7 +30,7 @@ class QwenLLMService(OpenAILLMService):
 
         Args:
             api_key: The API key for accessing Qwen's API (DashScope API key).
-            base_url: Base URL for Qwen API. Defaults to "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".
+            base_url: Base URL for Qwen API. Defaults to "https://dashscope.aliyuncs.com/compatible-mode/v1".
             model: The model identifier to use. Defaults to "qwen-plus".
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
         """
