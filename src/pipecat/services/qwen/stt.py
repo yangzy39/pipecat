@@ -141,7 +141,7 @@ if __name__ == "__main__":
     # 创建 DashScope STT 服务实例
     # stt_service = DashScopeSTTService(model="qwen3-asr-flash")
     stt = DashScopeSTTService(
-        api_key="skxxx",
+        api_key="xx",
         model="qwen3-asr-flash",
         language=Language.ZH,
         prompt="" # 可选
