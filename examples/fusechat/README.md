@@ -1,17 +1,13 @@
-# 基于Qwen3-ASR + FuseChat-3.0 + Qwen3-TTS实现的端到端语音交互框架
+<img width="1650" height="1181" alt="image" src="https://github.com/user-attachments/assets/cac2e77e-3912-4843-ac55-300b789e9124" /># 基于Qwen3-ASR + FuseChat-3.0 + Qwen3-TTS实现的端到端语音交互框架
+
 
 ## 核心修改
 
 pipecat/examples/fusechat/bot.py （pipeline定义，执行入口）
+
 pipecat/src/pipecat/services/qwen （实现dashscope调用api）
 
 ## Quickstart
-
-> Run your first Pipecat bot in under 5 minutes
-
-This quickstart guide will help you build and deploy your first Pipecat voice AI bot. You'll create a simple conversational agent that you can talk to in real-time, then deploy it to production on Pipecat Cloud.
-
-**Two steps**: Local Development (5 min) → Production Deployment (5 min)
 
 ### Prerequisites
 
