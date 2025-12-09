@@ -1,13 +1,11 @@
-#
-# DashScope (Aliyun) TTS Service for Pipecat
-# 基于 qwen3-tts-flash 模型
-#
-
 import os
 import base64
+import re
+import asyncio
+import functools
 import numpy as np
 import dashscope
-from typing import AsyncGenerator, Dict, Literal, Optional
+from typing import AsyncGenerator, Dict, Literal, Optional, List
 from loguru import logger
 from http import HTTPStatus
 
@@ -22,7 +20,8 @@ from pipecat.frames.frames import (
 from pipecat.services.tts_service import TTSService
 from pipecat.utils.tracing.service_decorators import traced_tts
 
-# 定义支持的音色列表 (根据您提供的表格整理)
+
+# # 定义支持的音色列表 (根据您提供的表格整理)
 VALID_VOICES: Dict[str, str] = {
     # 常用推荐
     "cherry": "Cherry",       # 芊悦 - 阳光积极、亲切自然小姐姐
@@ -82,11 +81,13 @@ VALID_VOICES: Dict[str, str] = {
     "kiki": "Kiki",           # 粤语-阿清
 }
 
-class DashScopeTTSService(TTSService):
-    """DashScope (Aliyun) TTS Service integration for Pipecat."""
 
-    # Qwen3-TTS-Flash / CosyVoice 默认输出采样率为 24000Hz
+class DashScopeTTSService(TTSService):
+    """DashScope (Aliyun) TTS Service integration for Pipecat with full parallel chunking."""
+
     DASHSCOPE_SAMPLE_RATE = 24000
+    # 设置安全的分段长度，略小于600以留有余地
+    MAX_CHUNK_CHARS = 300 
 
     def __init__(
             self,
@@ -97,27 +98,20 @@ class DashScopeTTSService(TTSService):
             sample_rate: Optional[int] = 24000,
             **kwargs,
         ):
-            """
-            初始化 DashScope TTS 服务。
-            """
-            # 1. 确定最终使用的采样率
             target_sample_rate = sample_rate or self.DASHSCOPE_SAMPLE_RATE
             
-            # 2. 检查采样率警告
             if sample_rate and sample_rate != self.DASHSCOPE_SAMPLE_RATE:
                 logger.warning(
                     f"DashScope TTS usually outputs {self.DASHSCOPE_SAMPLE_RATE}Hz. "
                     f"Current config {sample_rate}Hz might cause playback speed issues."
                 )
             
-            # 3. 调用父类初始化
             super().__init__(sample_rate=target_sample_rate, **kwargs)
 
             self._api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
             if not self._api_key:
                 raise ValueError("DashScope API Key is required.")
 
-            # 配置 DashScope
             dashscope.api_key = self._api_key
             dashscope.base_http_api_url = 'https://dashscope.aliyuncs.com/api/v1'
 
@@ -125,75 +119,127 @@ class DashScopeTTSService(TTSService):
             self.set_voice(voice)
 
     def set_voice(self, voice: str):
-        """设置音色，支持大小写不敏感匹配"""
         voice_lower = voice.lower()
         if voice_lower in VALID_VOICES:
             self._voice_id = VALID_VOICES[voice_lower]
         else:
-            # 如果找不到映射，假设用户直接传了 DashScope 的原始 ID (如 "Cherry")
             logger.warning(f"Voice '{voice}' not found in internal map, using raw ID.")
             self._voice_id = voice
 
+    def _split_text(self, text: str) -> List[str]:
+        """
+        根据标点符号智能拆分文本，确保每段不超过 MAX_CHUNK_CHARS。
+        """
+        if len(text) < self.MAX_CHUNK_CHARS:
+            return [text]
+
+        chunks = []
+        curr_chunk = ""
+        # 使用正则拆分句子，保留分隔符
+        sentences = re.split(r'([。.!！?？\n]+)', text)
+        
+        for item in sentences:
+            if len(curr_chunk) + len(item) > self.MAX_CHUNK_CHARS:
+                if curr_chunk:
+                    chunks.append(curr_chunk)
+                curr_chunk = item
+            else:
+                curr_chunk += item
+        
+        if curr_chunk:
+            chunks.append(curr_chunk)
+            
+        return [c for c in chunks if c.strip()]
+
+    def _fetch_audio_sync(self, text: str) -> bytes:
+        """
+        同步辅助函数：获取单个片段的完整音频数据（已去除 WAV 头）。
+        """
+        try:
+            # 即使我们要等待所有结果，开启 stream=True 依然能更快地让 API 响应首包
+            # 只不过我们在本地会把它积攒起来再返回
+            response = dashscope.MultiModalConversation.call(
+                model=self.model_name,
+                text=text,
+                voice=self._voice_id,
+                stream=True 
+            )
+            
+            full_audio = bytearray()
+            is_first_chunk = True
+
+            for chunk in response:
+                if chunk.status_code != HTTPStatus.OK:
+                    logger.error(f"DashScope Error in chunk fetch: {chunk.code} - {chunk.message}")
+                    continue
+
+                if chunk.output and chunk.output.audio and chunk.output.audio.data:
+                    wav_bytes = base64.b64decode(chunk.output.audio.data)
+                    
+                    data_to_add = wav_bytes
+                    # 剥离 WAV 44字节头
+                    if is_first_chunk and wav_bytes.startswith(b'RIFF'):
+                        data_to_add = wav_bytes[44:]
+                        is_first_chunk = False
+                    
+                    full_audio.extend(data_to_add)
+            
+            return bytes(full_audio)
+        except Exception as e:
+            logger.error(f"Error fetching audio chunk: {e}")
+            return b""
+
     @traced_tts
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
-        """
-        调用 DashScope MultiModalConversation 接口进行流式 TTS 生成。
-        """
-        logger.debug(f"{self}: Generating TTS for text: [{text}]")
+        logger.debug(f"{self}: Generating TTS for text length: {len(text)}")
 
         try:
             await self.start_ttfb_metrics()
             yield TTSStartedFrame()
 
-            # 构建请求参数
-            # 注意：DashScope Python SDK 的 call 方法目前是同步阻塞的。
-            # 在高并发生产环境中，建议将其放入 thread executor 中运行，
-            # 但为了保持流式响应的简单性，此处直接在 async 循环中迭代。
-            response = dashscope.MultiModalConversation.call(
-                model=self.model_name,
-                text=text,
-                voice=self._voice_id,
-                stream=True,  # 开启流式
-                # language_type="Chinese", # 可选，SDK会自动推断
-            )
+            # 1. 拆分文本
+            text_chunks = self._split_text(text)
+            if not text_chunks:
+                yield TTSStoppedFrame()
+                return
 
-            is_first_chunk = True
+            loop = asyncio.get_running_loop()
+            tasks = []
 
-            for chunk in response:
-                if chunk.status_code != HTTPStatus.OK:
-                    error_msg = f"DashScope Error: {chunk.code} - {chunk.message}"
-                    logger.error(error_msg)
-                    yield ErrorFrame(error=error_msg)
-                    return
+            # 2. 为【所有】分段创建并行任务
+            # 注意：这里不再单独处理第一段，所有段都扔进线程池并行跑
+            for chunk_text in text_chunks:
+                task = loop.run_in_executor(
+                    None, 
+                    functools.partial(self._fetch_audio_sync, chunk_text)
+                )
+                tasks.append(task)
 
-                if chunk.output and chunk.output.audio and chunk.output.audio.data:
-                    # 获取 base64 音频数据
-                    b64_data = chunk.output.audio.data
-                    if b64_data:
-                        # 解码 base64
-                        wav_bytes = base64.b64decode(b64_data)
-                        
-                        # 处理 WAV 头 (RIFF)
-                        # DashScope 流式返回的每一块可能不带头，也可能第一块带头。
-                        # 我们这里简单处理：如果是第一块且包含 RIFF 头，去掉 44 字节头。
-                        audio_data = wav_bytes
-                        if is_first_chunk and wav_bytes.startswith(b'RIFF'):
-                             # 简单的 WAV 头剥离 (通常是 44 字节)
-                             audio_data = wav_bytes[44:]
-                        
-                        if len(audio_data) > 0:
-                            if is_first_chunk:
-                                await self.stop_ttfb_metrics()
-                                is_first_chunk = False
-                            
-                            # 生成音频帧
-                            # 1 channel, 16-bit PCM (DashScope默认)
-                            yield TTSAudioRawFrame(
-                                audio=audio_data, 
-                                sample_rate=self.sample_rate, 
-                                num_channels=1
-                            )
-                            await self.start_tts_usage_metrics(text)
+            # 3. 等待【所有】任务完成 (Parallel Wait)
+            # gather 会按照传入 task 的顺序返回结果列表，保证音频顺序正确
+            results = await asyncio.gather(*tasks)
+
+            # 4. 停止计时 (此时才算 TTS 准备完毕)
+            await self.stop_ttfb_metrics()
+
+            # 5. 合并并输出音频
+            # 我们可以把所有音频拼接成一个巨大的 bytes，然后切片输出，
+            # 这样可以避免发送过大的单帧导致传输拥堵。
+            combined_audio = b"".join(results)
+            
+            if len(combined_audio) > 0:
+                # # 定义切片大小，例如 8192 字节 (约 170ms) 或 16384 (约 340ms)
+                # chunk_size = 16384 
+                # for offset in range(0, len(combined_audio), chunk_size):
+                #     sub_chunk = combined_audio[offset:offset+chunk_size]
+                yield TTSAudioRawFrame(
+                    audio=combined_audio,
+                    sample_rate=self.sample_rate,
+                    num_channels=1
+                )
+                
+                # 记录 Tokens 使用情况 (简单累加文本长度)
+                await self.start_tts_usage_metrics(text)
 
             yield TTSStoppedFrame()
 
@@ -201,10 +247,9 @@ class DashScopeTTSService(TTSService):
             logger.error(f"{self} Exception: {e}")
             yield ErrorFrame(error=f"DashScope TTS execution error: {str(e)}")
 
-
 async def main():
     # 1. 配置 API Key (请替换为真实 Key 或确保环境变量存在)
-    api_key = "xx"
+    api_key = "sk-xx"
     
     # 2. 初始化服务 (测试不同的音色)
     # voice="cherry" (芊悦), "peter" (天津话), "mariana" (假设的其他音色)
@@ -215,8 +260,8 @@ async def main():
         sample_rate=24000
     )
 
-    text = "你好，我是 Pipecat。这是一个基于阿里云 DashScope 的实时语音合成测试。今天的风儿甚是喧嚣。"
-    output_filename = "/mnt/workspace/yitong.yzy/projects/serve_models/audios/output.wav"
+    text = """永和九年，岁在癸丑，暮春之初，会于会稽山阴之兰亭，修禊事也。群贤毕至，少长咸集。此地有崇山峻岭，茂林修竹；又有清流激湍，映带左右，引以为流觞曲水，列坐其次。虽无丝竹管弦之盛，一觞一咏，亦足以畅叙幽情。"""
+    output_filename = "xx/output.wav"
 
     logger.info(f"开始合成文本: {text}")
     
