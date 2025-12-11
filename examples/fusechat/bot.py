@@ -20,6 +20,10 @@ Run the bot using::
 """
 
 import os
+import certifi  
+
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -51,6 +55,7 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.qwen.tts import DashScopeTTSService
 from pipecat.services.qwen.stt import DashScopeSTTService
+from pipecat.services.qwen.tts_realtime import DashScopeTTSRealTimeService
 from pipecat.services.qwen.llm import QwenLLMService
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 # from pipecat.services.cartesia.tts import CartesiaTTSService
@@ -128,7 +133,7 @@ VALID_VOICES = {
 async def run_2bots(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    api_key = "sk-x"
+    api_key = "sk-"
 
     params=BaseOpenAILLMService.InputParams(
         # frequency_penalty=0.0,
@@ -241,7 +246,9 @@ async def run_2bots(transport: BaseTransport, runner_args: RunnerArguments):
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    api_key = "sk-x"
+    api_key = "sk-"
+
+    # api_key = "sk-"
 
     params=BaseOpenAILLMService.InputParams(
         # frequency_penalty=0.0,
@@ -278,6 +285,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sample_rate=24000
     )
 
+    tts_realtime = DashScopeTTSRealTimeService(
+        api_key=api_key,
+        voice=random.choice(list(VALID_VOICES.keys())),  # British Reading Lady
+        model="qwen3-tts-flash-realtime-2025-11-27",
+        sample_rate=24000
+    )
+
 
     llm = QwenLLMService(api_key=api_key,model='qwen2.5-7b-instruct',params=params)
 
@@ -290,6 +304,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # VERIFIER_PORT="23547"
     # API_BASE=f"http://${VERIFIER_HOST}:${VERIFIER_PORT}/v1"
 
+    # llm = BaseOpenAILLMService(base_url="http://localhost:11434/v1/", api_key="ollama",model='FuseChat-3.0-1B',params=params)
     # llm = BaseOpenAILLMService(api_key=API_BASE,model='FuseChat-3.0',params=params)
     # llm = BaseOpenAILLMService(base_url=API_BASE, api_key="EMPTY",model='gpt-oss-120b',params=params)
 
@@ -303,7 +318,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     messages = [
         {
             "role": "system",
-            "content": "You are FuseChat-3.0, created by Sun Yat-sen University Language Intelligence Technology (SLIT) AI Lab. Your response should not contain Markdown syntax or emojis.",
+            "content": "You are FuseChat-3.0, created by Shenzhen Loop Area Institute (深圳河套学院). Your response should not contain Markdown syntax or emojis.",
         },
     ]
 
@@ -320,13 +335,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             stt,
             context_aggregator.user(),  # User responses
             llm,  # LLM
-            ParallelPipeline(
-                [tts, transport.output()],
-                [context_aggregator.assistant()]
-            )
-            # tts,  # TTS
-            # transport.output(),  
-            # context_aggregator.assistant()
+            # ParallelPipeline(
+            #     [tts, transport.output()],
+            #     [context_aggregator.assistant()]
+            # )
+            tts_realtime,  # TTS
+            transport.output(),  
+            context_aggregator.assistant()
         ]
     )
 
