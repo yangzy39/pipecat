@@ -3,6 +3,7 @@ import base64
 import asyncio
 import threading
 import dashscope
+import re
 from typing import AsyncGenerator, Dict, Optional, List
 from loguru import logger
 
@@ -195,18 +196,21 @@ class DashScopeTTSRealTimeService(TTSService):
 
     @traced_tts
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+        # Remove markdown syntax before TTS
+        # text = self._remove_markdown(text)
+        text = text.replace("\n", " ")
         logger.debug(f"{self}: Generating Realtime TTS for [{text}]")
 
         try:
             await self.start_ttfb_metrics()
-            
+
             # 1. 准备异步队列和 EventLoop
             loop = asyncio.get_running_loop()
             queue = asyncio.Queue()
-            
+
             # 2. 初始化回调
             callback = _PipecatDashScopeCallback(loop, queue)
-            
+
             # 3. 在独立线程中运行 SDK 逻辑，避免阻塞 asyncio loop
             # DashScope Python SDK 的 connect/send 可能是同步阻塞的
             def run_sdk_client():
@@ -217,20 +221,20 @@ class DashScopeTTSRealTimeService(TTSService):
                         url=self._wss_url
                     )
                     client.connect()
-                    
+
                     # 更新 Session 配置
                     client.update_session(
                         voice=self._voice_id,
                         response_format=AudioFormat.PCM_24000HZ_MONO_16BIT,
                         mode='server_commit' # 提交模式，只有明确 finish 才会结束 session
                     )
-                    
+
                     # 发送文本
                     client.append_text(text)
-                    
+
                     # 结束流 (触发合成)
                     client.finish()
-                    
+
                 except Exception as e:
                     logger.error(f"DashScope SDK Thread Error: {e}")
                     loop.call_soon_threadsafe(queue.put_nowait, e)
@@ -239,34 +243,34 @@ class DashScopeTTSRealTimeService(TTSService):
             threading.Thread(target=run_sdk_client, daemon=True).start()
 
             yield TTSStartedFrame()
-            
+
             first_chunk_received = False
 
             # 4. 从队列中读取音频数据并 Yield
             while True:
                 # 等待数据，如果 SDK 线程异常或网络卡顿，这里会异步等待
                 item = await queue.get()
-                
+
                 # 收到 None 表示结束
                 if item is None:
                     break
-                
+
                 # 收到 Exception 表示出错
                 if isinstance(item, Exception):
                     raise item
-                
+
                 # 收到 Bytes 数据
                 if isinstance(item, bytes):
                     if not first_chunk_received:
                         await self.stop_ttfb_metrics()
                         first_chunk_received = True
-                    
+
                     yield TTSAudioRawFrame(
                         audio=item,
                         sample_rate=self.sample_rate,
                         num_channels=1
                     )
-            
+
             await self.start_tts_usage_metrics(text)
             yield TTSStoppedFrame()
 
