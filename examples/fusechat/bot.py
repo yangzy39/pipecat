@@ -58,6 +58,7 @@ from pipecat.services.qwen.stt import DashScopeSTTService
 from pipecat.services.qwen.tts_realtime import DashScopeTTSRealTimeService
 from pipecat.services.qwen.llm import QwenLLMService
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
+from pipecat.services.ollama.llm import OLLamaLLMService
 # from pipecat.services.cartesia.tts import CartesiaTTSService
 # from pipecat.services.deepgram.stt import DeepgramSTTService
 # from pipecat.services.openai.llm import OpenAILLMService
@@ -70,6 +71,118 @@ import random
 logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
+
+from pipecat.utils.text.base_text_aggregator import BaseTextAggregator, Aggregation, AggregationType
+from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
+from typing import AsyncIterator
+import re
+
+class ProgressiveSentenceAggregator(BaseTextAggregator):
+    """一个自定义文本聚合器，根据yield次数逐渐增加句子数量"""
+    
+    # 常见的英文缩写列表，这些缩写后的句点不应被视为句子结束
+    COMMON_ABBREVIATIONS = {
+        'e.g.', 'i.e.', 'etc.', 'dr.', 'mr.', 'mrs.', 'ms.', 'prof.', 'inc.', 'corp.', 
+        'dept.', 'ave.', 'blvd.', 'st.', 'co.', 'vs.', 'vol.', 'no.', 'nos.', 'jan.', 
+        'feb.', 'mar.', 'apr.', 'jun.', 'jul.', 'aug.', 'sep.', 'oct.', 'nov.', 'dec.',
+        'mon.', 'tue.', 'wed.', 'thu.', 'fri.', 'sat.', 'sun.', 'ed.', 'eds.', 'jr.',
+        'sr.', 'capt.', 'col.', 'gen.', 'maj.', 'sgt.', 'lt.', 'cmdr.', 'adm.', 'gov.',
+        'sen.', 'rep.', 'pres.', 'rev.', 'ph.d.', 'm.d.', 'd.d.s.', 'd.v.m.', 'll.b.',
+        'u.s.', 'u.k.', 'u.s.a.', 'u.s.s.r.', 'a.m.', 'p.m.', 'b.c.', 'a.d.'
+    }
+    def __init__(self, min_sentences=1, max_sentences=5):
+        """
+        初始化聚合器
+        
+        Args:
+            min_sentences: 最少句子数（初始值），默认为1
+            max_sentences: 最多句子数（最大值），默认为5
+        """
+        self._text = ""
+        self.min_sentences = min_sentences
+        self.max_sentences = max_sentences
+        self.yield_count = 0  # 记录yield的次数
+        # 定义句子结束符的正则表达式
+        self.sentence_endings = re.compile(r'''
+        #     (?<!                                  # Negative lookbehind
+        #         \b(?:\d|                          # Not preceded by digit (for numbered lists)
+        #              e\.g|i\.e|etc|dr|mr|mrs|ms|  # Or common abbreviations
+        #              prof|inc|corp|dept|ave|blvd|
+        #              st|co|vs|vol|no|nos|jan|feb|
+        #              mar|apr|jun|jul|aug|sep|oct|
+        #              nov|dec|mon|tue|wed|thu|fri|
+        #              sat|sun|ed|eds|jr|sr|capt|col|
+        #              gen:maj|sgt|lt|cmdr|adm|gov|
+        #              sen|rep|pres|rev|ph|d|ll|u| 
+        #              a\.m|p\.m|b\.c|a\.d)\.       # With a period
+        #     )
+        #     (?:[.!?。！？…]+)                     # Sentence ending punctuation
+        #     (?!                                   # Negative lookahead
+        #         \s*[)\d]|\s*[a-zA-Z]             # Not followed by space and digit/close paren
+        #                                          # or space and letter (for abbreviations)
+        #     )
+        #     \s*                                   # Optional whitespace
+        # ''', re.VERBOSE | re.IGNORECASE)
+        self.sentence_endings = re.compile(r'(?<!\b\d)(?:[.:：；．｡!?。！？…]+)(?!\s*[)\d])\s*')
+        # self.sentence_endings = re.compile(r'[.!?。！？…]+\s*')
+        self.limit_list = [1,1,2,3,5,10,20,40,100,100,100]
+        
+    @property
+    def text(self) -> Aggregation:
+        return Aggregation(text=self._text.strip(), type=AggregationType.SENTENCE)
+        
+    async def aggregate(self, text: str) -> AsyncIterator[Aggregation]:
+        # 将新文本添加到缓冲区
+        # if len(self._text) == 0:
+        #     self.yield_count = 0
+
+        self._text += text
+        
+        # 查找句子结束符的数量
+        sentences_found = 0
+        last_pos = 0
+        sentence_positions = []
+        
+        # 在当前文本中查找句子结束符位置
+        for match in self.sentence_endings.finditer(self._text):
+            sentences_found += 1
+            last_pos = match.end()
+            sentence_positions.append(last_pos)
+            
+            # 如果达到了当前阈值，就触发一次TTS
+            if sentences_found >= self.limit_list[self.yield_count]:
+                # 提取完整的句子块
+                sentence_block = self._text[:last_pos]
+                self._text = self._text[last_pos:]
+                
+                # 增加yield计数
+                # if self.yield_count < len(self.limit_list):
+                self.yield_count += 1
+                
+                yield Aggregation(text=sentence_block.strip(), type=AggregationType.SENTENCE)
+                sentences_found = 0  # 重置计数
+                sentence_positions = []  # 重置位置记录
+                break  # 一次只处理一个块
+                
+    async def flush(self):
+        # 返回任何剩余的文本
+        if self._text:
+            result = self._text
+            self._text = ""
+            # 即使没有达到阈值，也要增加yield计数
+            self.yield_count = 0
+            return Aggregation(text=result.strip(), type=AggregationType.SENTENCE)
+        self.yield_count = 0
+        return None
+        
+    async def handle_interruption(self):
+        self._text = ""
+        self.yield_count = 0  # 重置计数器
+        
+    async def reset(self):
+        # self._text = ""
+        self.yield_count = 0  # 重置计数器
+
 
 VALID_VOICES = {
     # 常用推荐
@@ -87,8 +200,8 @@ VALID_VOICES = {
     # "nofish": "Nofish",       # 不吃鱼 - 不会翘舌音的设计师
     # "bella": "Bella",         # 萌宝 - 喝酒不打醉拳的小萝莉
     # "jennifer": "Jennifer",   # 詹妮弗 - 电影质感美语
-    # "ryan": "Ryan",           # 甜茶 - 节奏拉满
-    # "katerina": "Katerina",   # 卡捷琳娜 - 御姐音色
+    "ryan": "Ryan",           # 甜茶 - 节奏拉满
+    "katerina": "Katerina",   # 卡捷琳娜 - 御姐音色
     # "aiden": "Aiden",         # 艾登 - 美语大男孩
     # "eldric": "Eldric Sage",  # 沧明子 - 沉稳睿智老者
     # "mia": "Mia",             # 乖小妹 - 温顺如春水
@@ -96,7 +209,7 @@ VALID_VOICES = {
     # "bellona": "Bellona",     # 燕铮莺 - 声音洪亮，江湖气
     # "vincent": "Vincent",     # 田叔 - 沙哑烟嗓
     # "bunny": "Bunny",         # 萌小姬 - 萌属性爆棚
-    # "neil": "Neil",           # 阿闻 - 专业新闻主持
+    "neil": "Neil",           # 阿闻 - 专业新闻主持
     # "elias": "Elias",         # 墨讲师 - 严谨叙事
     # "arthur": "Arthur",       # 徐大爷 - 质朴旱烟嗓
     # "nini": "Nini",           # 邻家妹妹 - 软糯甜美
@@ -133,7 +246,7 @@ VALID_VOICES = {
 async def run_2bots(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    api_key = "sk-"
+    api_key = os.environ.get("DASHSCOPE_API_KEY")
 
     params=BaseOpenAILLMService.InputParams(
         # frequency_penalty=0.0,
@@ -246,20 +359,22 @@ async def run_2bots(transport: BaseTransport, runner_args: RunnerArguments):
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
-    api_key = "sk-"
+    api_key = os.environ.get("DASH_API_KEY")
 
-    # api_key = "sk-"
+    print(api_key)
 
     params=BaseOpenAILLMService.InputParams(
         # frequency_penalty=0.0,
         # presence_penalty=0.0,
+        # stream=False,
+        # stream_options=None,
         seed=42,
         temperature=0.7,
         top_p=0.95,
         max_tokens=2048,
         max_completion_tokens=768,
         # service_tier="standard",
-        extra={}
+        # extra=dict(stream=False, stream_options=None)
     )
 
     # stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
@@ -278,22 +393,29 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     #     sample_rate=24000
     # )
 
-    tts = DashScopeTTSService(
-        api_key=api_key,
-        voice=random.choice(list(VALID_VOICES.keys())),  # British Reading Lady
-        model="qwen3-tts-flash-2025-11-27",
-        sample_rate=24000
-    )
+    # tts = DashScopeTTSService(
+    #     api_key=api_key,
+    #     voice=random.choice(list(VALID_VOICES.keys())),  # British Reading Lady
+    #     model="qwen3-tts-flash-2025-11-27",
+    #     sample_rate=24000,
+    #     text_aggregator=ProgressiveSentenceAggregator(),
+    #     text_filters=[MarkdownTextFilter()],
+    # )
 
     tts_realtime = DashScopeTTSRealTimeService(
         api_key=api_key,
         voice=random.choice(list(VALID_VOICES.keys())),  # British Reading Lady
         model="qwen3-tts-flash-realtime-2025-11-27",
-        sample_rate=24000
+        sample_rate=24000,
+        text_aggregator=ProgressiveSentenceAggregator(),
+        text_filters=[MarkdownTextFilter()],
+        # aggregate_sentences=False  
     )
 
+    # llm = BaseOpenAILLMService(base_url="http://localhost:11434/v1/", api_key="ollama",model='FuseChat-3.0-7B',params=params)
+    llm = OLLamaLLMService(model='FuseChat-3.0-7B',params=params)
 
-    llm = QwenLLMService(api_key=api_key,model='qwen2.5-7b-instruct',params=params)
+    # llm = QwenLLMService(api_key=api_key,model='qwen2.5-7b-instruct',params=params)
 
     # VERIFIER_HOST="22.8.148.33"
     # VERIFIER_PORT="23547"
@@ -304,7 +426,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # VERIFIER_PORT="23547"
     # API_BASE=f"http://${VERIFIER_HOST}:${VERIFIER_PORT}/v1"
 
-    # llm = BaseOpenAILLMService(base_url="http://localhost:11434/v1/", api_key="ollama",model='FuseChat-3.0-1B',params=params)
+    # 
     # llm = BaseOpenAILLMService(api_key=API_BASE,model='FuseChat-3.0',params=params)
     # llm = BaseOpenAILLMService(base_url=API_BASE, api_key="EMPTY",model='gpt-oss-120b',params=params)
 
@@ -318,7 +440,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     messages = [
         {
             "role": "system",
-            "content": "You are FuseChat-3.0, created by Shenzhen Loop Area Institute (深圳河套学院). Your response should not contain Markdown syntax or emojis.",
+            "content": "You are FuseChat, created by Shenzhen Loop Area Institute (深圳河套学院). Your response should not contain Markdown syntax or emojis.",
         },
     ]
 
@@ -327,7 +449,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
-
+    # The ParallelPipeline allows us to process TTS/audio and text context aggregation concurrently
     pipeline = Pipeline(
         [
             transport.input(),  # Transport user input
@@ -335,13 +457,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             stt,
             context_aggregator.user(),  # User responses
             llm,  # LLM
+            # Parallel processing for simultaneous text and audio output
+            tts_realtime, 
+            transport.output(),
+            context_aggregator.assistant(),
             # ParallelPipeline(
-            #     [tts, transport.output()],
-            #     [context_aggregator.assistant()]
+            #     [tts_realtime, transport.output()],  # TTS generation and audio output
+            #     [context_aggregator.assistant()]      # Text context aggregation for UI display
             # )
-            tts_realtime,  # TTS
-            transport.output(),  
-            context_aggregator.assistant()
         ]
     )
 
@@ -383,7 +506,7 @@ async def bot(runner_args: RunnerArguments):
             video_in_enabled=False,      # Disable video input
             video_out_enabled=False, 
             audio_out_sample_rate=24000,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
             turn_analyzer=LocalSmartTurnAnalyzerV3(),
         ),
         "webrtc": lambda: TransportParams(
@@ -392,7 +515,7 @@ async def bot(runner_args: RunnerArguments):
             video_in_enabled=False,      # Disable video input
             video_out_enabled=False, 
             audio_out_sample_rate=24000,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
             turn_analyzer=LocalSmartTurnAnalyzerV3(),
         ),
     }
