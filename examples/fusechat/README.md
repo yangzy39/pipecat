@@ -13,58 +13,80 @@ pipecat/src/pipecat/services/qwen （实现dashscope调用api）
 
 **Environment**
 
-* Python 3.10 or later
-* [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager installed
+* Python 3.12
 
 ### Setup
 
-1. Clone the quickstart repository
-
+1. Install pipecat
+   
 ```bash  theme={null}
-git clone https://github.com/pipecat-ai/pipecat-quickstart.git
-cd pipecat-quickstart
+cd pipecat
+pip install -e .
 ```
 
 2. Set up virtual environment and install dependencies
 
 ```bash  theme={null}
-uv sync
+pip install -r requirements.txt
 ```
+
+3. Download Ollama
+
+3.1 See https://ollama.com/ to download ollama
+
+3.2 Download model
+
+```bash  theme={null}
+# download gguf model
+ollama pull modelscope.cn/bartowski/FuseChat-Qwen-2.5-7B-Instruct-GGUF
+# rename
+ollama cp modelscope.cn/bartowski/FuseChat-Qwen-2.5-7B-Instruct-GGUF FuseChat-3.0-7B
+ollama rm modelscope.cn/bartowski/FuseChat-Qwen-2.5-7B-Instruct-GGUF
+```
+
+4. Download ngrok
+
+See https://ngrok.com/
+
+   
 
 ### Run your bot locally
 
-1. Deploy FuseChat model using vllm
+1. Deploy FuseChat model using ollama
 
-```bash
-export BIN="<YOUR_PYTHON_EXE_DIR>"
-export MODEL_CKPT="MODEL_PATH"
-
-${BIN}/vllm serve ${MODEL_CKPT} \
-    --served-model-name Fusechat-3.0 \
-    --host 0.0.0.0 \
-    --tensor-parallel-size 1 \
-    --max-model-len 32768 \
-    --port 23547 
+```bash  theme={null}
+ollama run FuseChat-3.0-7B
 ```
 
-2. Configure your API keys
+2. Configure your Dash API keys
 
-set api_key in [pipecat/examples/fusechat/bot.py](https://github.com/yangzy39/pipecat/blob/a04c4e421c2573feb267d3f45a038cccbd71f143/examples/fusechat/bot.py#L127)
-set vllm model name and host in [pipecat/examples/fusechat/bot.py](https://github.com/yangzy39/pipecat/blob/a04c4e421c2573feb267d3f45a038cccbd71f143/examples/fusechat/bot.py#L159)
+export DASHSCOPE_API_KEY="sk-xx"
 
-3. Start server
+3. Generate ngrok proxy
+
 ```bash  theme={null}
-uv run bot.py
+ngrok http 8000 --region=jp
+```
+
+copy the proxy (https://xxx.ngrok-free.dev) from output like
+
+```
+Forwarding                    https://xxx.ngrok-free.dev -> http://localhost:8000
+```
+
+4. Start server
+```bash  theme={null}
+python bot.py --port 8000 -proxy <your_ngrok_proxy>
 ```
 
 You should see output similar to this:
 
 ```
-🚀 WebRTC server starting at http://localhost:7860/client
+🚀 WebRTC server starting at http://localhost:8000/client
    Open this URL in your browser to connect!
 ```
 
-Open [http://localhost:7860/client](http://localhost:7860/client) in your browser and click **Connect** to start talking to your bot.
+Open [http://localhost:8000/client](http://localhost:8000/client) in your browser or <your_ngrok_proxy> on another device, then click **Connect** to start talking to your bot.
 
 
 🎉 **Success!** Your bot is running locally. Now let's deploy it to production so others can use it.
