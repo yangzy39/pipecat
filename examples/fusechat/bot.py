@@ -23,7 +23,19 @@ from dotenv import load_dotenv
 from loguru import logger
 from PIL import Image
 
+print("🚀 Starting Pipecat bot...")
+print("⏳ Loading models and imports (20 seconds, first run only)\n")
+
+logger.info("Loading Local Smart Turn Analyzer V3...")
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+
+logger.info("✅ Local Smart Turn Analyzer V3 loaded")
+logger.info("Loading Silero VAD model...")
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+logger.info("✅ Silero VAD model loaded")
+
+from pipecat.audio.vad.vad_analyzer import VADParams
+
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -34,6 +46,7 @@ from pipecat.frames.frames import (
     OutputImageRawFrame,
     SpriteFrame,
     StartFrame,
+    TranscriptionFrame,
     UserStartedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
@@ -53,12 +66,13 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.ollama.llm import OLLamaLLMService
-from pipecat.services.qwen.llm import QwenLLMService
+# from pipecat.services.qwen.llm import QwenLLMService
 from pipecat.services.qwen.stt import DashScopeSTTService
 from pipecat.services.qwen.tts_realtime import DashScopeTTSRealTimeService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.utils.text.base_text_aggregator import BaseTextAggregator, Aggregation, AggregationType
 from pipecat.utils.text.markdown_text_filter import MarkdownTextFilter
+# from pipecat.transports.daily.transport import DailyParams
 
 load_dotenv(override=True)
 
@@ -135,6 +149,28 @@ class PushToTalkGate(FrameProcessor):
             elif data.get("state") == "stop":
                 self._gate_opened = False
                 logger.info("Input gate closed - user stopped talking")
+
+
+class HistoryResetter(FrameProcessor):
+    def __init__(self, context: LLMContext, system_prompt: dict):
+        super().__init__()
+        self._context = context
+        self._system_prompt = system_prompt
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            text = frame.text.strip().lower()
+            if len(text) < 15 and any(flag in text for flag in ["clear history","清除历史","清空历史","清除对话","清空对话"]):
+            # if text in ["clear history", "clear history.", "清除历史对话。", "清除历史对话", "清空历史对话。""清空历史对话。", "清空历史对话", "清除对话。", "清除对话", "清空对话。", "清空对话"]:
+                logger.info("Resetting conversation history.")
+                self._context.set_messages([self._system_prompt])
+                # await self.push_frame(TranscriptionFrame(text="重新介绍自己。"))
+                # Consume the frame and don't pass it down.
+                # return
+
+        await self.push_frame(frame, direction)
 
 
 class ProgressiveSentenceAggregator(BaseTextAggregator):
@@ -246,7 +282,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
     api_key = os.environ.get("DASHSCOPE_API_KEY", "YOUR_API_KEY")
-    
+
     params = BaseOpenAILLMService.InputParams(
         seed=42,
         temperature=0.7,
@@ -275,11 +311,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     messages = [
         {
             "role": "system",
-            "content": "You are FuseChat, created by Shenzhen Loop Area Institute (深圳河套学院). Engage in natural, brief conversations. Avoid Markdown or emojis in your responses.",
+            "content": "你是FuseChat，由深圳河套学院（Shenzhen Loop Area Institute）创造的人工智能对话助手。请以自然、简短、口语化的风格进行交流，就像日常和朋友聊天一样。在你的回答中，请不要使用任何Markdown格式（比如粗体或列表）或表情符号（emoji）。",
         },
     ]
+    # messages = [
+    #     {
+    #         "role": "system",
+    #         "content": "You are FuseChat, created by Shenzhen Loop Area Institute (深圳河套学院). Engage in natural, brief conversations. Avoid Markdown or emojis in your responses.",
+    #     },
+    # ]
 
     context = LLMContext(messages)
+    system_prompt = messages[0]
+    history_resetter = HistoryResetter(context, system_prompt)
     context_aggregator = LLMContextAggregatorPair(context)
 
     # push_to_talk_gate = PushToTalkGate()
@@ -292,6 +336,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             rtvi,
             # push_to_talk_gate,
             stt,
+            history_resetter,
             context_aggregator.user(),
             llm,
             ParallelPipeline(
@@ -332,6 +377,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
 async def bot(runner_args: RunnerArguments):
     transport_params = {
+        # "daily": lambda: DailyParams(
+        #     audio_in_enabled=True,
+        #     audio_out_enabled=True,
+        #     video_in_enabled=False,  # Disable video input
+        #     video_out_enabled=True,
+        #     video_out_width=1024,
+        #     video_out_height=576,
+        #     audio_out_sample_rate=24000,
+        #     vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+        #     turn_analyzer=LocalSmartTurnAnalyzerV3(),
+        # ),
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
@@ -340,7 +396,8 @@ async def bot(runner_args: RunnerArguments):
             video_out_width=1024,
             video_out_height=576,
             audio_out_sample_rate=24000,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
+            turn_analyzer=LocalSmartTurnAnalyzerV3(),
         ),
     }
 
